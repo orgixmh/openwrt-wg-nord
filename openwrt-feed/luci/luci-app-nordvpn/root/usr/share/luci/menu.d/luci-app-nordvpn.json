@@ -1,0 +1,10 @@
+{
+  "admin/services/nordvpn": {
+    "title": "NordVPN",
+    "order": 90,
+    "action": {
+      "type": "view",
+      "path": "nordvpn"
+    }
+  }
+}

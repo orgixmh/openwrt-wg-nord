@@ -1,0 +1,16 @@
+{
+  "luci-app-nordvpn": {
+    "description": "Grant access to NordVPN LuCI app",
+    "read": {
+      "uci": [ "nordvpn" ]
+    },
+    "write": {
+      "uci": [ "nordvpn" ],
+      "file": {
+        "/usr/sbin/nordvpnctl": [ "exec" ],
+        "/usr/libexec/nordvpn-refresh": [ "exec" ],
+        "/var/run/nordvpn.status": [ "read" ]
+      }
+    }
+  }
+}

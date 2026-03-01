@@ -18,7 +18,7 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
 
 log "refresh started"
 
-if /usr/sbin/nordvpnctl gen-config && /usr/sbin/nordvpnctl connect; then
+if /usr/sbin/nordvpnctl --gen-config && /usr/sbin/nordvpnctl c; then
 	uci -q set nordvpn.settings.last_refresh="$(date +%s)"
 	uci -q commit nordvpn
 	log "refresh completed successfully"
