@@ -1,0 +1,6 @@
+#!/bin/sh
+
+/etc/init.d/nordvpn enable >/dev/null 2>&1
+/etc/init.d/nordvpn reload >/dev/null 2>&1
+
+exit 0

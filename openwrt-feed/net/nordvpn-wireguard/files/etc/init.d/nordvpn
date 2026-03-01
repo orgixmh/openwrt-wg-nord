@@ -1,0 +1,56 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=15
+USE_PROCD=0
+
+reload_cron() {
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+
+setup_cron() {
+	local enabled auto_refresh refresh_days
+	enabled="$(uci -q get nordvpn.settings.enabled)"
+	auto_refresh="$(uci -q get nordvpn.settings.auto_refresh)"
+	refresh_days="$(uci -q get nordvpn.settings.refresh_days)"
+
+	[ -n "$refresh_days" ] || refresh_days=3
+
+	mkdir -p /etc/crontabs
+	touch /etc/crontabs/root
+
+	sed -i '\|/usr/libexec/nordvpn-refresh|d' /etc/crontabs/root
+
+	if [ "$enabled" = "1" ] && [ "$auto_refresh" = "1" ]; then
+		echo "0 4 */$refresh_days * * /usr/libexec/nordvpn-refresh >/dev/null 2>&1" >> /etc/crontabs/root
+	fi
+
+	sort -u /etc/crontabs/root -o /etc/crontabs/root
+	reload_cron
+}
+
+start() {
+	setup_cron
+
+	local enabled auto_connect
+	enabled="$(uci -q get nordvpn.settings.enabled)"
+	auto_connect="$(uci -q get nordvpn.settings.auto_connect)"
+
+	if [ "$enabled" = "1" ] && [ "$auto_connect" = "1" ]; then
+		/usr/sbin/nordvpnctl connect
+	fi
+}
+
+stop() {
+	/usr/sbin/nordvpnctl disconnect >/dev/null 2>&1
+}
+
+restart() {
+	stop
+	start
+}
+
+reload() {
+	setup_cron
+}

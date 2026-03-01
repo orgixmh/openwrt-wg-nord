@@ -1,0 +1,29 @@
+#!/bin/sh
+
+LOCKDIR="/var/lock/nordvpn-refresh.lock"
+STATUS_FILE="$(uci -q get nordvpn.settings.status_file)"
+[ -n "$STATUS_FILE" ] || STATUS_FILE="/var/run/nordvpn.status"
+
+log() {
+	logger -t nordvpn-refresh "$*"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" > "$STATUS_FILE"
+}
+
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+	log "refresh skipped: lock already held"
+	exit 0
+fi
+
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+
+log "refresh started"
+
+if /usr/sbin/nordvpnctl gen-config && /usr/sbin/nordvpnctl connect; then
+	uci -q set nordvpn.settings.last_refresh="$(date +%s)"
+	uci -q commit nordvpn
+	log "refresh completed successfully"
+	exit 0
+fi
+
+log "refresh failed"
+exit 1

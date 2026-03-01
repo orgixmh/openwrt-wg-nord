@@ -1,0 +1,512 @@
+#!/bin/sh
+# nordvpnctl.sh
+#
+# Single interactive/CLI tool that merges:
+# - generateConfig.sh (generate config + build interface + route via Nord)
+# - revert.sh         (route back via default interface / revert Nord routing)
+#
+# Menu:
+# 1) Generate new nord vpn config
+# 2) Create nordVPN interface (requires config file)
+# 3) Route traffic via nordVPN interface
+# 4) Route traffic via default interface (revert)
+# 0) Exit
+#
+# CLI actions:
+#   --gen-config
+#   --create-iface
+#   --route-vpn
+#   --route-default
+#   --auto   (legacy alias for 'c')
+#   c        (auto: generate if missing + route via NordVPN)
+#   d        (disconnect/revert to default interface)
+#   s        (status)
+#
+# Notes:
+# - Uses ONLY the commands already present in your generateConfig.sh + revert.sh,
+#   plus the requested $? check around wg-nord config generation.
+# - Commits/restarts are done ONCE per action.
+
+
+set -eu
+
+CONF="/etc/nordvpn/config/nord.conf"
+
+TOKEN_FILE="$(uci -q get nordvpn.settings.token_file)"
+CONF="$(uci -q get nordvpn.settings.conf_file)"
+SERVER="$(uci -q get nordvpn.settings.server)"
+
+[ -n "$TOKEN_FILE" ] || TOKEN_FILE="/etc/nordvpn/config/token"
+[ -n "$CONF" ] || CONF="/etc/nordvpn/config/nord.conf"
+[ -n "$SERVER" ] || SERVER="si14.nordvpn.com"
+
+
+QUIET="0"
+
+say() {
+  [ "${QUIET}" = "1" ] && return 0
+  echo "[nordvpnctl] $*"
+}
+
+client_msg() {
+  echo "$*"
+}
+
+
+now_epoch() { date +%s; }
+
+is_connected() {
+  uci show firewall | grep nordwg > /dev/null
+  return $?
+}
+
+current_server_url() {
+  # Prefer config file if present; else fall back to UCI endpoint_host.
+  if [ -f "$CONF" ]; then
+    s="$(sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1 | cut -d: -f1)"
+    [ -n "$s" ] && echo "$s" && return 0
+  fi
+  s="$(uci -q get network.@wireguard_nordwg[0].endpoint_host 2>/dev/null || true)"
+  [ -n "$s" ] && echo "$s" && return 0
+  echo "(unknown)"
+}
+
+# ----------------------------
+# Shared helpers (from generateConfig.sh)
+# ----------------------------
+extract_from_conf() {
+  # 2) Extract fields safely (preserves trailing '=' padding in keys)
+  # Note: These pick the first match found in the file.
+  PRIV="$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+  ADDR="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+  DNSV="$(sed -n 's/^DNS[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+
+  PUB="$(sed -n 's/^PublicKey[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+  ENDP="$(sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+  ALLOWED="$(sed -n 's/^AllowedIPs[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+  KA="$(sed -n 's/^PersistentKeepalive[[:space:]]*=[[:space:]]*//p' "$CONF" | head -n1)"
+
+  # 3) Minimal validation
+  if [ -z "$PRIV" ] || [ -z "$PUB" ] || [ -z "$ENDP" ]; then
+    echo "FAILED: Missing required fields in $CONF (PrivateKey/PublicKey/Endpoint)."
+    exit 1
+  fi
+
+  ENDPOINT_HOST="$(printf '%s' "$ENDP" | cut -d: -f1)"
+  ENDPOINT_PORT="$(printf '%s' "$ENDP" | awk -F: '{print $NF}')"
+
+  if [ -z "$ENDPOINT_HOST" ] || [ -z "$ENDPOINT_PORT" ]; then
+    echo "FAILED: Could not parse Endpoint host/port from: $ENDP"
+    exit 1
+  fi
+}
+
+require_conf() {
+  if [ ! -f "$CONF" ]; then
+    say "ERROR: Config file not found at $CONF"
+    say "Run option 1 (Generate config) first."
+    exit 1
+  fi
+}
+
+# ----------------------------
+# Action 1: Generate config only
+# ----------------------------
+action_gen_config() {
+  say "Step 1/1: Generating NordVPN WireGuard config -> $CONF"
+  /etc/nordvpn/tools/wg-nord --server $SERVER --token "$(cat $TOKEN_FILE)" > "$CONF"
+  if [ "$?" != "0" ]; then
+    echo "NordVPN configuration generation FAILED!"
+    exit 1
+  fi
+  say "OK: Config generated."
+}
+
+# ----------------------------
+# Action 2: Create nordwg interface only (requires config)
+#   - Applies only the UCI network.nordwg + peer setup from generateConfig.sh
+#   - Commits + network restart ONCE
+# ----------------------------
+action_create_iface() {
+  require_conf
+  say "Loading config: $CONF"
+  extract_from_conf
+
+  say "Creating/Updating OpenWrt network interface: network.nordwg (WireGuard client)"
+  # 4) Recreate UCI network config (subset)
+  uci -q delete network.nordwg
+
+  uci set network.nordwg='interface'
+  uci set network.nordwg.proto='wireguard'
+  uci set network.nordwg.private_key="$PRIV"
+
+  # If Address exists in the wg-nord output, apply it (some configs include IPv4/IPv6 CIDRs)
+  if [ -n "$ADDR" ]; then
+    # Clear addresses list first to avoid duplicates
+    uci -q delete network.nordwg.addresses
+    # Split on comma if multiple addresses exist
+    echo "$ADDR" | tr ',' '\n' | while IFS= read -r a; do
+      a="$(echo "$a" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$a" ] && uci add_list network.nordwg.addresses="$a"
+    done
+  fi
+
+  # Add peer
+  PEER_SECTION="$(uci add network wireguard_nordwg)"
+  uci set network."$PEER_SECTION".public_key="$PUB"
+  uci set network."$PEER_SECTION".endpoint_host="$ENDPOINT_HOST"
+  uci set network."$PEER_SECTION".endpoint_port="$ENDPOINT_PORT"
+
+  # AllowedIPs (full tunnel)
+  uci -q delete network."$PEER_SECTION".allowed_ips
+  if echo "$ALLOWED" | grep -q '0.0.0.0/0'; then
+    echo "$ALLOWED" | tr ',' '\n' | while IFS= read -r ip; do
+      ip="$(echo "$ip" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$ip" ] && uci add_list network."$PEER_SECTION".allowed_ips="$ip"
+    done
+  else
+    uci add_list network."$PEER_SECTION".allowed_ips='0.0.0.0/0'
+  fi
+
+  # Keepalive (optional)
+  if [ -n "$KA" ]; then
+    uci set network."$PEER_SECTION".persistent_keepalive="$KA"
+  fi
+
+  # Optional: set route_allowed_ips = 1 (as in your generateConfig.sh)
+  uci set network.nordwg.auto='1'
+
+  say "Committing network changes..."
+  uci commit network
+
+  say "Restarting network service..."
+  /etc/init.d/network reload
+
+  say "OK: nordwg interface created/updated."
+  say "Endpoint: $ENDPOINT_HOST:$ENDPOINT_PORT"
+}
+
+# ----------------------------
+# Action 3: Route LAN traffic via Nord (requires config)
+#   - Applies firewall zone + forwarding + MARK rule + PBR route/rule + kill-switch
+#   - Commits + restarts ONCE each (firewall + network)
+#   - Also ensures interface exists by (re)applying the interface portion (same commands as action 2)
+# ----------------------------
+action_route_vpn() {
+  require_conf
+  say "Loading config: $CONF"
+  extract_from_conf
+
+  say "Applying NordVPN interface + routing + firewall rules..."
+
+  # --- Network (same commands as in generateConfig.sh, includes interface creation)
+  uci -q delete network.nordwg
+
+  uci set network.nordwg='interface'
+  uci set network.nordwg.proto='wireguard'
+  uci set network.nordwg.private_key="$PRIV"
+
+  if [ -n "$ADDR" ]; then
+    uci -q delete network.nordwg.addresses
+    echo "$ADDR" | tr ',' '\n' | while IFS= read -r a; do
+      a="$(echo "$a" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$a" ] && uci add_list network.nordwg.addresses="$a"
+    done
+  fi
+
+  PEER_SECTION="$(uci add network wireguard_nordwg)"
+  uci set network."$PEER_SECTION".public_key="$PUB"
+  uci set network."$PEER_SECTION".endpoint_host="$ENDPOINT_HOST"
+  uci set network."$PEER_SECTION".endpoint_port="$ENDPOINT_PORT"
+
+  uci -q delete network."$PEER_SECTION".allowed_ips
+  if echo "$ALLOWED" | grep -q '0.0.0.0/0'; then
+    echo "$ALLOWED" | tr ',' '\n' | while IFS= read -r ip; do
+      ip="$(echo "$ip" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$ip" ] && uci add_list network."$PEER_SECTION".allowed_ips="$ip"
+    done
+  else
+    uci add_list network."$PEER_SECTION".allowed_ips='0.0.0.0/0'
+  fi
+
+  if [ -n "$KA" ]; then
+    uci set network."$PEER_SECTION".persistent_keepalive="$KA"
+  fi
+
+  uci set network.nordwg.auto='1'
+
+  # PBR (from generateConfig.sh)
+  uci add network route >/dev/null
+  uci set network.@route[-1].interface='nordwg'
+  uci set network.@route[-1].target='0.0.0.0/0'
+  uci set network.@route[-1].table='51820'
+
+  uci add network rule >/dev/null
+  uci set network.@rule[-1].mark='0x1234/0xffff'
+  uci set network.@rule[-1].lookup='51820'
+  uci set network.@rule[-1].priority='10000'
+
+  # --- Firewall (from generateConfig.sh)
+  uci -q delete firewall.nord
+  uci set firewall.nord='zone'
+  uci set firewall.nord.name='nord'
+  uci add_list firewall.nord.network='nordwg'
+  uci set firewall.nord.input='REJECT'
+  uci set firewall.nord.output='ACCEPT'
+  uci set firewall.nord.forward='REJECT'
+  uci set firewall.nord.masq='1'
+  uci set firewall.nord.mtu_fix='1'
+
+  uci -q delete firewall.lan_nord
+  uci set firewall.lan_nord='forwarding'
+  uci set firewall.lan_nord.src='lan'
+  uci set firewall.lan_nord.dest='nord'
+
+  uci -q delete firewall.nord_mark
+  uci set firewall.nord_mark='rule'
+  uci set firewall.nord_mark.name='NORDWG: mark LAN traffic'
+  uci set firewall.nord_mark.src='lan'
+  uci set firewall.nord_mark.dest='*'
+  uci set firewall.nord_mark.proto='all'
+  uci set firewall.nord_mark.target='MARK'
+  uci set firewall.nord_mark.set_mark='0x1234/0xffff'
+
+  # Kill-switch (from generateConfig.sh)
+  uci -q delete firewall.nord_killswitch
+  uci set firewall.nord_killswitch='rule'
+  uci set firewall.nord_killswitch.name='KillSwitch: block LAN->WAN'
+  uci set firewall.nord_killswitch.src='lan'
+  uci set firewall.nord_killswitch.dest='wan'
+  uci set firewall.nord_killswitch.proto='all'
+  uci set firewall.nord_killswitch.target='REJECT'
+
+  say "Committing firewall changes..."
+  uci commit firewall
+  say "Committing network changes..."
+  uci commit network
+
+  say "Restarting firewall service..."
+  /etc/init.d/firewall restart
+  say "Restarting network service..."
+  /etc/init.d/network reload
+
+
+  say "OK: LAN traffic routed via NordVPN (nordwg) and kill-switch enabled."
+  say "Interface: nordwg"
+  say "Endpoint:  $ENDPOINT_HOST:$ENDPOINT_PORT"
+}
+
+# ----------------------------
+# Action 4: Route traffic via default interface (revert.sh)
+# ----------------------------
+action_route_default() {
+  say "Running revert (route traffic via default interface)..."
+
+  TS="$(date +%Y%m%d-%H%M%S)"
+  BACKUP_DIR="/root/nord-revert-backup"
+  mkdir -p "$BACKUP_DIR"
+
+  cp /etc/config/network  "$BACKUP_DIR/network.$TS"
+  cp /etc/config/firewall "$BACKUP_DIR/firewall.$TS"
+  [ -f /etc/config/dhcp ] && cp /etc/config/dhcp "$BACKUP_DIR/dhcp.$TS"
+
+  say "Backed up configs to: $BACKUP_DIR/*.$TS"
+
+  # ---- Firewall removals
+  uci -q delete firewall.nord || true
+  uci -q delete firewall.lan_nord || true
+  uci -q delete firewall.nord_mark || true
+  uci -q delete firewall.nord_killswitch || true
+
+  # ---- Delete nordVPN Interface and Peer
+  uci -q delete network.nordwg
+  uci -q delete network.@wireguard_nordwg[0]
+
+  # ---- Network: remove PBR rule/route entries matching our values
+  i=0
+  while uci -q get network.@rule[$i] >/dev/null 2>&1; do
+    mark="$(uci -q get network.@rule[$i].mark 2>/dev/null || true)"
+    lookup="$(uci -q get network.@rule[$i].lookup 2>/dev/null || true)"
+    prio="$(uci -q get network.@rule[$i].priority 2>/dev/null || true)"
+    if [ "$mark" = "0x1234/0xffff" ] && [ "$lookup" = "51820" ] && [ "$prio" = "10000" ]; then
+      uci -q delete network.@rule[$i] || true
+      continue
+    fi
+    i=$((i+1))
+  done
+
+  i=0
+  while uci -q get network.@route[$i] >/dev/null 2>&1; do
+    table="$(uci -q get network.@route[$i].table 2>/dev/null || true)"
+    iface="$(uci -q get network.@route[$i].interface 2>/dev/null || true)"
+    target="$(uci -q get network.@route[$i].target 2>/dev/null || true)"
+    if [ "$table" = "51820" ] && [ "$iface" = "nordwg" ] && [ "$target" = "0.0.0.0/0" ]; then
+      uci -q delete network.@route[$i] || true
+      continue
+    fi
+    i=$((i+1))
+  done
+
+  i=0
+  while uci -q get network.@wireguard_nordwg[$i] >/dev/null 2>&1; do
+    ra="$(uci -q get network.@wireguard_nordwg[$i].route_allowed_ips 2>/dev/null || true)"
+    if [ "$ra" = "0" ]; then
+      uci -q delete network.@wireguard_nordwg[$i].route_allowed_ips || true
+    fi
+    i=$((i+1))
+  done
+
+  say "Committing firewall changes..."
+  uci commit firewall
+  say "Committing network changes..."
+  uci commit network
+
+  say "Restarting firewall service..."
+  /etc/init.d/firewall restart
+  say "Restarting network service..."
+  /etc/init.d/network reload
+
+
+  # ---- Runtime cleanup (in case they are present right now)
+  ip rule del fwmark 0x1234/0xffff lookup 51820 priority 10000 2>/dev/null || true
+  ip route flush table 51820 2>/dev/null || true
+
+  say "OK: Revert completed."
+  say "If needed, restore backups from: $BACKUP_DIR"
+}
+
+# ----------------------------
+# Auto mode
+# ----------------------------
+action_auto() {
+  if [ ! -f "$CONF" ]; then
+    say "Auto mode: config not found, generating..."
+    action_gen_config
+  else
+    say "Auto mode: config exists ($CONF), skipping generation."
+  fi
+
+  # Important: do not apply network changes twice.
+  # action_route_vpn already creates interface + routing + firewall and commits/reloads once.
+  action_route_vpn
+}
+
+action_status() {
+  serverURL="$(current_server_url)"
+
+  if is_connected; then
+    client_msg "Connected to $serverURL"
+    return 0
+  fi
+
+  # Differentiate between "configured but not connected" and "not configured"
+  if uci -q get network.nordwg >/dev/null 2>&1; then
+    client_msg "Not connected (configured server: $serverURL)"
+  else
+    client_msg "Not connected (nordwg not configured)"
+  fi
+  return 1
+}
+
+action_c_connect() {
+  serverURL="$(current_server_url)"
+  QUIET="1"
+  # Mimic wg-nord style client output
+  printf "  Connecting to %s... " "$serverURL"
+
+  if action_auto >/dev/null 2>&1; then
+    :
+  else
+    rc=$?
+    QUIET="0"
+    client_msg "Failed to connect!"
+    exit "$rc"
+  fi
+
+
+  QUIET="0"
+
+  if is_connected; then
+    echo "Connected to $serverURL"
+    return 0
+  fi
+
+  echo "Failed to connect!"
+  exit 1
+}
+
+action_d_disconnect() {
+  client_msg "Disconnecting from nordvpn."
+  QUIET="1"
+  if action_route_default >/dev/null 2>&1; then
+    :
+  else
+    rc=$?
+    QUIET="0"
+    client_msg "Failed to disconnect!"
+    exit "$rc"
+  fi
+  QUIET="0"
+}
+
+# ----------------------------
+# Menu UI
+# ----------------------------
+menu() {
+  while true; do
+    echo ""
+    echo "1) Generate new nord vpn config"
+    echo "2) Create nordVPN interface"
+    echo "3) Route traffic via nordVPN interface"
+    echo "4) Route traffic via default interface"
+    echo "5) Status"
+    echo "0) Exit"
+    printf "Select: "
+    read -r choice
+
+    case "$choice" in
+      1) action_gen_config ;;
+      2) action_create_iface ;;
+      3) action_route_vpn ;;
+      4) action_route_default ;;
+      5) action_status || true ;;
+      0) exit 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+# ----------------------------
+# CLI parsing
+# ----------------------------
+if [ "${1:-}" = "" ]; then
+  menu
+  exit 0
+fi
+
+case "${1:-}" in
+  --gen-config)      action_gen_config ;;
+  --create-iface)    action_create_iface ;;
+  --route-vpn)       action_route_vpn ;;
+  --route-default)   action_d_disconnect ;;
+  --auto)            action_c_connect ;;
+  c)                 action_c_connect ;;
+  d)                 action_d_disconnect ;;
+  status)        action_status ;;
+  -h|--help)
+    echo "Usage:"
+    echo "  $0                (interactive menu)"
+    echo "  $0 --gen-config"
+    echo "  $0 --create-iface"
+    echo "  $0 --route-vpn"
+    echo "  $0 --route-default   (legacy alias for 'd')"
+    echo "  $0 --auto            (legacy alias for 'c')"
+    echo "  $0 c                 (connect/auto)"
+    echo "  $0 d                 (disconnect/revert)"
+    echo "  $0 s|--status        (status)"
+    ;;
+  *)
+    echo "Unknown argument: ${1:-}"
+    exit 1
+    ;;
+esac
