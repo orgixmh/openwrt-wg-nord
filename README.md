@@ -1,5 +1,5 @@
-# wg-nord
-
+# openwrt-wg-nord
+(openwrt package for wg-nord)
 Command-line tool for generating WireGuard configuration files for NordVPN
 
 ```
